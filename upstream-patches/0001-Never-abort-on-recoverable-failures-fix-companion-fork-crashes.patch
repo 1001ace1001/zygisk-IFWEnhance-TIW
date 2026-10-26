@@ -1,0 +1,1206 @@
+From 81e9cb5c7ef16660919a1c33b96117682812c3fb Mon Sep 17 00:00:00 2001
+From: fix <fix@localhost>
+Date: Tue, 27 Oct 2026 03:31:51 +0800
+Subject: [PATCH] Never abort() on recoverable failures (fix companion + fork
+ crashes)
+
+Zygisk runs this code inside the zygote fork child (pre*Specialize),
+the freshly specialized target process incl. system_server
+(post*Specialize) and the module companion daemon (zygiskd64).
+abort() in any of these contexts kills the forked app, system_server
+(soft reboot) or the whole companion daemon, and a dead companion then
+makes the NEXT fork abort on connectCompanion() failure - a cascade
+observed in the field (tombstones with zygisk_companion_entry+708 and
+SIGABRT inside nativeForkAndSpecialize).
+
+- companion (handleFileRequest): a broken client connection, failed
+  open()/mmap() during INITIALIZE or any other request failure now
+  logs LOGW/LOGE and drops that request instead of aborting; state is
+  committed only after every step succeeded
+- zygote side (initialize/isInitialized/shouldEnableForPackage/
+  fetchResources/isUseBinderInterceptors): any socket I/O or fd failure
+  degrades to "module not injected into this process"
+- dex.c: never abort post-specialize; clear pending JNI exceptions on
+  every failure path; degrade when binder interceptors are unavailable
+- binder.c: fix reply parcel native pointer (was reading the data
+  parcel twice); clear pending exceptions on lookup failures
+- process.c: survive GetStringUTFChars failures instead of
+  strdup(NULL) crashes
+- main.c: resource_map_fd/resource_map_file return NULL on failure
+- main_riru.cpp: refuse to load instead of crashing the Riru daemon
+  when resources/module.prop are unusable; sprintf -> snprintf
+- logger.h: LOGW/LOGE are always logged in release builds, LOGF now
+  logs before aborting so future tombstones carry an abort message
+- Loader.java: fix inverted isBinderInterceptorAvailable guards in
+  unregisterRedirectBinder/callExecTransact
+---
+ runtime/src/main/cpp/binder.c                 |  22 +-
+ runtime/src/main/cpp/dex.c                    | 155 ++++++-
+ runtime/src/main/cpp/dex.h                    |   8 +-
+ runtime/src/main/cpp/logger.h                 |  11 +-
+ runtime/src/main/cpp/main.c                   |  38 +-
+ runtime/src/main/cpp/main_riru.cpp            |  50 ++-
+ runtime/src/main/cpp/main_zygisk.cpp          | 389 ++++++++++++++----
+ runtime/src/main/cpp/main_zygisk.h            |   6 +-
+ runtime/src/main/cpp/process.c                |  29 +-
+ .../github/kr328/zloader/internal/Loader.java |   4 +-
+ 10 files changed, 598 insertions(+), 114 deletions(-)
+
+diff --git a/runtime/src/main/cpp/binder.c b/runtime/src/main/cpp/binder.c
+index 2a52b91..b1ed2d0 100644
+--- a/runtime/src/main/cpp/binder.c
++++ b/runtime/src/main/cpp/binder.c
+@@ -68,7 +68,10 @@ static jboolean JNICALL jni_call_exec_transact(
+ 
+     jlong reply_ptr = 0;
+     if (reply != NULL) {
+-        reply_ptr = original_jni_env->GetLongField(env, data, f_native_ptr);
++        // FIX: read the native pointer of the *reply* parcel (was `data`,
++        // which passed the data parcel pointer as the reply and corrupted
++        // Parcel objects inside system_server).
++        reply_ptr = original_jni_env->GetLongField(env, reply, f_native_ptr);
+     }
+ 
+     return invoke_next_call_boolean_method(
+@@ -82,6 +85,15 @@ static jboolean JNICALL jni_call_exec_transact(
+     );
+ }
+ 
++// Clear any pending exception left by a failed JNI lookup. Leaving an
++// exception pending inside system_server crashes the process later at an
++// unrelated JNI call site.
++static void clear_pending_exception(JNIEnv *env) {
++    if ((*env)->ExceptionCheck(env)) {
++        (*env)->ExceptionClear(env);
++    }
++}
++
+ int binder_interceptors_init(JNIEnv *env, jclass c_loader) {
+     void (*set_jni_env)(struct JNINativeInterface *) = plt_dlsym(
+             "_ZN3art9JNIEnvExt16SetTableOverrideEPK18JNINativeInterface", NULL);
+@@ -91,42 +103,50 @@ int binder_interceptors_init(JNIEnv *env, jclass c_loader) {
+ 
+     c_binder = (*env)->FindClass(env, "android/os/Binder");
+     if (c_binder == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     m_exec_transact = (*env)->GetMethodID(env, c_binder, "execTransact", "(IJJI)Z");
+     if (m_exec_transact == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     jclass c_parcel = (*env)->FindClass(env, "android/os/Parcel");
+     if (c_parcel == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     f_native_ptr = (*env)->GetFieldID(env, c_parcel, "mNativePtr", "J");
+     if (f_native_ptr == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     jclass c_map = (*env)->FindClass(env, "java/util/Map");
+     if (c_map == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     m_get = (*env)->GetMethodID(env, c_map, "get", "(Ljava/lang/Object;)Ljava/lang/Object;");
+     if (m_get == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     jfieldID f_redirect_binders = (*env)->GetStaticFieldID(
+             env, c_loader, "redirectBinders", "Ljava/util/WeakHashMap;");
+     if (f_redirect_binders == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+     o_redirect_binders = (*env)->GetStaticObjectField(env, c_loader, f_redirect_binders);
+     if (o_redirect_binders == NULL) {
++        clear_pending_exception(env);
+         return 1;
+     }
+ 
+diff --git a/runtime/src/main/cpp/dex.c b/runtime/src/main/cpp/dex.c
+index 72dce89..c2ac15d 100644
+--- a/runtime/src/main/cpp/dex.c
++++ b/runtime/src/main/cpp/dex.c
+@@ -7,40 +7,111 @@
+ #include <dlfcn.h>
+ #include <string.h>
+ 
+-#define find_class(var_name, name) jclass var_name = (*env)->FindClass(env, name); fatal_assert((var_name) != NULL)
+-#define find_static_method(var_name, clazz, name, signature) jmethodID var_name = (*env)->GetStaticMethodID(env, clazz, name, signature); fatal_assert((var_name) != NULL)
+-#define find_method(var_name, clazz, name, signature) jmethodID var_name = (*env)->GetMethodID(env, clazz, name, signature); fatal_assert((var_name) != NULL)
+-#define new_string(text) (*env)->NewStringUTF(env, text)
++// This runs in the freshly specialized target process (including
++// system_server). Any failure here must degrade to "module not loaded",
++// NEVER abort(): aborting kills the forked app (or system_server, which
++// soft-reboots the whole system).
+ 
+-void dex_load_and_invoke(
++static jclass find_class(JNIEnv *env, const char *name) {
++    jclass clazz = (*env)->FindClass(env, name);
++
++    if (clazz == NULL) {
++        LOGW("dex: FindClass %s failed", name);
++
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++    }
++
++    return clazz;
++}
++
++static jmethodID get_static_method(JNIEnv *env, jclass clazz, const char *name, const char *signature) {
++    jmethodID method = (*env)->GetStaticMethodID(env, clazz, name, signature);
++
++    if (method == NULL) {
++        LOGW("dex: GetStaticMethodID %s failed", name);
++
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++    }
++
++    return method;
++}
++
++static jmethodID get_method(JNIEnv *env, jclass clazz, const char *name, const char *signature) {
++    jmethodID method = (*env)->GetMethodID(env, clazz, name, signature);
++
++    if (method == NULL) {
++        LOGW("dex: GetMethodID %s failed", name);
++
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++    }
++
++    return method;
++}
++
++bool dex_load_and_invoke(
+         JNIEnv *env,
+         const char *package_name,
+         const void *dex_block, uint32_t dex_length,
+         const void *properties_block, uint32_t properties_length,
+-        int use_binder_interceptors
++        bool use_binder_interceptors
+ ) {
+-    find_class(c_class_loader, "java/lang/ClassLoader");
+-    find_static_method(
+-            m_get_system_class_loader,
++    if (dex_block == NULL || properties_block == NULL) {
++        LOGW("dex: null resources");
++
++        return false;
++    }
++
++    jclass c_class_loader = find_class(env, "java/lang/ClassLoader");
++    if (c_class_loader == NULL) {
++        return false;
++    }
++
++    jmethodID m_get_system_class_loader = get_static_method(
++            env,
+             c_class_loader,
+             "getSystemClassLoader",
+             "()Ljava/lang/ClassLoader;"
+     );
++    if (m_get_system_class_loader == NULL) {
++        return false;
++    }
+ 
+     jobject o_system_class_loader = (*env)->CallStaticObjectMethod(
+             env,
+             c_class_loader,
+             m_get_system_class_loader
+     );
+-    fatal_assert(o_system_class_loader != NULL);
++    if (o_system_class_loader == NULL) {
++        LOGW("dex: getSystemClassLoader failed");
+ 
+-    find_class(c_dex_class_loader, "dalvik/system/InMemoryDexClassLoader");
+-    find_method(
+-            m_dex_class_loader,
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++
++        return false;
++    }
++
++    jclass c_dex_class_loader = find_class(env, "dalvik/system/InMemoryDexClassLoader");
++    if (c_dex_class_loader == NULL) {
++        return false;
++    }
++
++    jmethodID m_dex_class_loader = get_method(
++            env,
+             c_dex_class_loader,
+             "<init>",
+             "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"
+     );
++    if (m_dex_class_loader == NULL) {
++        return false;
++    }
++
+     jobject o_dex_class_loader = (*env)->NewObject(
+             env,
+             c_dex_class_loader,
+@@ -48,38 +119,78 @@ void dex_load_and_invoke(
+             (*env)->NewDirectByteBuffer(env, (void *) dex_block, dex_length),
+             o_system_class_loader
+     );
+-    fatal_assert(o_dex_class_loader != NULL);
++    if (o_dex_class_loader == NULL) {
++        LOGW("dex: create InMemoryDexClassLoader failed");
+ 
+-    find_method(
+-            m_load_class,
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++
++        return false;
++    }
++
++    jmethodID m_load_class = get_method(
++            env,
+             c_class_loader,
+             "loadClass",
+             "(Ljava/lang/String;)Ljava/lang/Class;"
+     );
++    if (m_load_class == NULL) {
++        return false;
++    }
+ 
+     jclass c_loader = (*env)->CallObjectMethod(
+             env,
+             o_dex_class_loader,
+             m_load_class,
+-            new_string("com.github.kr328.zloader.internal.Loader")
++            (*env)->NewStringUTF(env, "com.github.kr328.zloader.internal.Loader")
+     );
+-    fatal_assert(c_loader != NULL);
++    if (c_loader == NULL) {
++        LOGW("dex: load Loader class failed");
++
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++
++        return false;
++    }
+ 
+     if (use_binder_interceptors) {
+         LOGD("Enable binder interceptors");
+ 
+-        int interceptor_initialized = binder_interceptors_init(env, c_loader);
+-        fatal_assert(interceptor_initialized == 0);
++        // Degrade instead of aborting when the ART internal symbol is
++        // missing (e.g. after an ART update): the module simply runs
++        // without binder interception in that process.
++        if (binder_interceptors_init(env, c_loader) != 0) {
++            LOGW("dex: binder interceptors unavailable, continue without them");
++
++            use_binder_interceptors = false;
++        }
+     }
+ 
+-    find_static_method(m_load, c_loader, "load", "(Ljava/lang/String;Ljava/nio/ByteBuffer;Z)V");
++    jmethodID m_load = get_static_method(env, c_loader, "load", "(Ljava/lang/String;Ljava/nio/ByteBuffer;Z)V");
++    if (m_load == NULL) {
++        return false;
++    }
+ 
++    // Loader.load(...) catches everything on the Java side; nothing is
++    // expected to be pending afterwards, but check defensively anyway.
+     (*env)->CallStaticVoidMethod(
+             env,
+             c_loader,
+             m_load,
+-            new_string(package_name),
++            (*env)->NewStringUTF(env, package_name),
+             (*env)->NewDirectByteBuffer(env, (void *) properties_block, properties_length),
+             (jboolean) use_binder_interceptors
+     );
++
++    if ((*env)->ExceptionCheck(env)) {
++        LOGW("dex: Loader.load threw");
++
++        (*env)->ExceptionClear(env);
++
++        return false;
++    }
++
++    return true;
+ }
+diff --git a/runtime/src/main/cpp/dex.h b/runtime/src/main/cpp/dex.h
+index 48fe916..ca9b07f 100644
+--- a/runtime/src/main/cpp/dex.h
++++ b/runtime/src/main/cpp/dex.h
+@@ -2,17 +2,21 @@
+ 
+ #include <jni.h>
+ #include <stdint.h>
++#include <stdbool.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-void dex_load_and_invoke(
++// Returns true when the entrypoint class was loaded and invoked.
++// Returns false (with any pending JNI exception cleared) when loading
++// failed: the target process keeps running, just without the module injected.
++bool dex_load_and_invoke(
+         JNIEnv *env,
+         const char *package_name,
+         const void *dex_block, uint32_t dex_length,
+         const void *properties_block, uint32_t properties_length,
+-        int use_binder_interceptors
++        bool use_binder_interceptors
+ );
+ 
+ #ifdef __cplusplus
+diff --git a/runtime/src/main/cpp/logger.h b/runtime/src/main/cpp/logger.h
+index 94b7415..5c7e6cf 100644
+--- a/runtime/src/main/cpp/logger.h
++++ b/runtime/src/main/cpp/logger.h
+@@ -11,12 +11,19 @@ extern "C" {
+ 
+ #ifdef DEBUG
+ #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, TAG, __VA_ARGS__)
+-#define LOGF(...) do { __android_log_print(ANDROID_LOG_FATAL, TAG, __VA_ARGS__); abort(); } while (0)
+ #else
+ #define LOGD(...)
+-#define LOGF(...) abort()
+ #endif
+ 
++// Warnings and errors are always logged, even in release builds:
++// they mark recoverable failures that would otherwise be invisible.
++#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
++#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
++
++// Fatal errors are ALWAYS logged before aborting, otherwise tombstones
++// are produced without any abort message and are impossible to diagnose.
++#define LOGF(...) do { __android_log_print(ANDROID_LOG_FATAL, TAG, __VA_ARGS__); abort(); } while (0)
++
+ #define fatal_assert(expr) if (!(expr)) LOGF("!(" #expr ")")
+ 
+ #ifdef __cplusplus
+diff --git a/runtime/src/main/cpp/main.c b/runtime/src/main/cpp/main.c
+index de2e611..b7a9eef 100644
+--- a/runtime/src/main/cpp/main.c
++++ b/runtime/src/main/cpp/main.c
+@@ -9,21 +9,47 @@
+ #include <sys/stat.h>
+ 
+ struct Resource *resource_map_fd(int fd) {
++    if (fd < 0) {
++        LOGW("resource_map_fd: invalid fd");
++        return NULL;
++    }
++
+     struct stat s;
+-    fatal_assert(fstat(fd, &s) >= 0);
++    if (fstat(fd, &s) < 0) {
++        LOGW("resource_map_fd: fstat failed");
++        return NULL;
++    }
++
++    if (s.st_size <= 0) {
++        LOGW("resource_map_fd: empty file");
++        return NULL;
++    }
+ 
+     void *base = mmap(NULL, s.st_size, PROT_READ, MAP_SHARED, fd, 0);
+-    fatal_assert(base != MAP_FAILED);
++    if (base == MAP_FAILED) {
++        LOGW("resource_map_fd: mmap failed");
++        return NULL;
++    }
+ 
+     struct Resource *resource = (struct Resource *) malloc(sizeof(struct Resource));
++    if (resource == NULL) {
++        munmap(base, s.st_size);
++        return NULL;
++    }
++
+     resource->base = base;
+     resource->length = s.st_size;
++
+     return resource;
+ }
+ 
+ struct Resource *resource_map_file(const char *path) {
+     int fd = open(path, O_RDONLY);
+-    fatal_assert(fd >= 0);
++
++    if (fd < 0) {
++        LOGW("resource_map_file: open %s failed", path);
++        return NULL;
++    }
+ 
+     struct Resource *resource = resource_map_fd(fd);
+ 
+@@ -33,7 +59,11 @@ struct Resource *resource_map_file(const char *path) {
+ }
+ 
+ void resource_release(struct Resource *resource) {
++    if (resource == NULL) {
++        return;
++    }
++
+     munmap(resource->base, resource->length);
+ 
+     free(resource);
+-}
+\ No newline at end of file
++}
+diff --git a/runtime/src/main/cpp/main_riru.cpp b/runtime/src/main/cpp/main_riru.cpp
+index 85032c7..bdbb40c 100644
+--- a/runtime/src/main/cpp/main_riru.cpp
++++ b/runtime/src/main/cpp/main_riru.cpp
+@@ -11,6 +11,8 @@
+ #include <stddef.h>
+ #include <string.h>
+ #include <stdlib.h>
++#include <stdio.h>
++#include <limits.h>
+ #include <unistd.h>
+ #include <fcntl.h>
+ 
+@@ -41,14 +43,18 @@ static int shouldSkipUid(_unused int uid) {
+ static int shouldEnableForPackage(const char *pkg) {
+     char path[PATH_MAX] = {0};
+ 
+-    sprintf(path, "%s/packages/%s", moduleDirectory, pkg);
++    if (pkg == nullptr) {
++        return 0;
++    }
++
++    snprintf(path, sizeof(path), "%s/packages/%s", moduleDirectory, pkg);
+     if (access(path, F_OK) == 0) {
+         LOGD("Enabled for package %s", pkg);
+ 
+         return 1;
+     }
+ 
+-    sprintf(path, "%s/packages/%s", dataDirectory, pkg);
++    snprintf(path, sizeof(path), "%s/packages/%s", dataDirectory, pkg);
+     if (access(path, F_OK) == 0) {
+         LOGD("Enabled for package %s", pkg);
+ 
+@@ -196,11 +202,27 @@ RiruVersionedModuleInfo *init(Riru *riru) {
+          moduleDirectory, riru->riruApiVersion);
+ 
+     char path[PATH_MAX] = {0};
+-    sprintf(path, "%s/%s", moduleDirectory, "module.prop");
++    snprintf(path, sizeof(path), "%s/%s", moduleDirectory, "module.prop");
+     moduleProp = resource_map_file(path);
+-    sprintf(path, "%s/%s", moduleDirectory, "classes.dex");
++    snprintf(path, sizeof(path), "%s/%s", moduleDirectory, "classes.dex");
+     classesDex = resource_map_file(path);
+ 
++    if (moduleProp == nullptr || classesDex == nullptr) {
++        // Fail to load the module instead of crashing the Riru daemon.
++        LOGW("Failed to load module resources: %s", moduleDirectory);
++
++        if (moduleProp != nullptr) {
++            resource_release(moduleProp);
++            moduleProp = nullptr;
++        }
++        if (classesDex != nullptr) {
++            resource_release(classesDex);
++            classesDex = nullptr;
++        }
++
++        return nullptr;
++    }
++
+     struct Module module = {
+             .dataDirectory = nullptr,
+             .versionName = nullptr,
+@@ -211,9 +233,23 @@ RiruVersionedModuleInfo *init(Riru *riru) {
+             moduleProp->base, moduleProp->length,
+             &module, reinterpret_cast<properties_for_each_block>(&scanModule)
+     );
+-    fatal_assert(module.versionName != nullptr);
+-    fatal_assert(module.versionCode >= 0);
+-    fatal_assert(module.dataDirectory != nullptr);
++
++    if (module.dataDirectory == nullptr || module.versionName == nullptr || module.versionCode < 0) {
++        // Missing critical module.prop entries: refuse to load instead of
++        // crashing the Riru daemon.
++        LOGW("module.prop is incomplete, refusing to load");
++
++        free(module.dataDirectory);
++        free(module.versionName);
++
++        resource_release(moduleProp);
++        resource_release(classesDex);
++
++        moduleProp = nullptr;
++        classesDex = nullptr;
++
++        return nullptr;
++    }
+ 
+     dataDirectory = module.dataDirectory;
+     useBinderInterceptors = module.useBinderInterceptors;
+diff --git a/runtime/src/main/cpp/main_zygisk.cpp b/runtime/src/main/cpp/main_zygisk.cpp
+index 90d351e..3052f28 100644
+--- a/runtime/src/main/cpp/main_zygisk.cpp
++++ b/runtime/src/main/cpp/main_zygisk.cpp
+@@ -4,16 +4,42 @@
+ #include "serializer.h"
+ #include "properties.h"
+ #include "process.h"
+-#include "logger.h"
+ #include "dex.h"
+ 
+ #include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <limits.h>
+ #include <jni.h>
+ #include <fcntl.h>
+ #include <unistd.h>
+ #include <malloc.h>
+ #include <pthread.h>
+ 
++// ============================================================
++// Crash-safety rules for this file
++//
++// Zygisk runs this code in three distinct contexts:
++//
++//   1. the zygote / freshly forked (not yet specialized) child,
++//      during onLoad/pre*Specialize;
++//   2. the freshly specialized target process (including
++//      system_server), during post*Specialize;
++//   3. the module's root companion process (zygiskd64), for
++//      handleFileRequest().
++//
++// abort() in context (1) kills the app being forked (SIGABRT,
++// "failed to start"), abort() in context (2) can kill
++// system_server (soft reboot), and abort() in context (3) kills
++// the companion daemon, which in turn makes the next fork abort
++// in context (1) - a cascade observed in production tombstones.
++//
++// Therefore: NO fatal_assert() on socket I/O, open(), mmap() or
++// any other runtime failure in this file. Every failure degrades
++// to "module not injected into this process" and is logged with
++// LOGW/LOGE instead.
++// ============================================================
++
+ enum FileCommand : int {
+     INITIALIZE, IS_INITIALIZED, IS_USE_BINDER_INTERCEPTORS, GET_RESOURCES, SHOULD_ENABLE_FOR_PACKAGE
+ };
+@@ -25,7 +51,8 @@ struct InitializeData {
+ 
+ static void extractInitializeData(InitializeData *data, const char *key, const char *value) {
+     if (strcmp(key, "dataDirectory") == 0) {
+-        strcpy(data->dataDirectory, value);
++        strncpy(data->dataDirectory, value, sizeof(data->dataDirectory) - 1);
++        data->dataDirectory[sizeof(data->dataDirectory) - 1] = '\0';
+     } else if (strcmp(key, "useBinderInterceptors") == 0) {
+         data->useBinderInterceptors = (strcmp(value, "true") == 0);
+     }
+@@ -40,7 +67,14 @@ static void handleFileRequest(int client) {
+     static bool useBinderInterceptors = false;
+ 
+     int command = -1;
+-    fatal_assert(serializer_read_int(client, &command) > 0);
++    if (serializer_read_int(client, &command) <= 0) {
++        // The peer (a forked process blocked in pre*Specialize) died or the
++        // connection broke. This is expected and recoverable: dropping the
++        // request only disables the module for that single process.
++        LOGW("Companion: failed to read command (peer closed connection?)");
++
++        return;
++    }
+ 
+     switch (static_cast<FileCommand>(command)) {
+         case INITIALIZE: {
+@@ -49,33 +83,96 @@ static void handleFileRequest(int client) {
+             if (moduleDirectory == -1) {
+                 LOGD("Remote initializing");
+ 
+-                fatal_assert(serializer_read_file_descriptor(client, &moduleDirectory) > 0);
+-
+-                moduleProp = openat(moduleDirectory, "module.prop", O_RDONLY);
+-                fatal_assert(moduleProp >= 0);
+-
+-                classesDex = openat(moduleDirectory, "classes.dex", O_RDONLY);
+-                fatal_assert(classesDex >= 0);
+-
+-                InitializeData initializeData;
+-                Resource *block = resource_map_fd(moduleProp);
+-                properties_for_each(
+-                        block->base, block->length,
+-                        &initializeData,
+-                        reinterpret_cast<properties_for_each_block>(&extractInitializeData)
+-                );
+-                resource_release(block);
+-                fatal_assert(strlen(initializeData.dataDirectory) > 0);
+-
+-                dataDirectory = open(initializeData.dataDirectory, O_RDONLY | O_DIRECTORY);
+-                fatal_assert(dataDirectory >= 0);
+-
+-                useBinderInterceptors = initializeData.useBinderInterceptors;
+-
+-                LOGD("Remote initialized: dataDirectory = %s", initializeData.dataDirectory);
++                int receivedDir = -1;
++                int prop = -1;
++                int dex = -1;
++                int data = -1;
++
++                do {
++                    if (serializer_read_file_descriptor(client, &receivedDir) <= 0) {
++                        LOGE("Companion: INITIALIZE: failed to receive module dir fd");
++
++                        break;
++                    }
++
++                    prop = openat(receivedDir, "module.prop", O_RDONLY);
++                    if (prop < 0) {
++                        LOGE("Companion: INITIALIZE: open module.prop failed");
++
++                        break;
++                    }
++
++                    dex = openat(receivedDir, "classes.dex", O_RDONLY);
++                    if (dex < 0) {
++                        LOGE("Companion: INITIALIZE: open classes.dex failed");
++
++                        break;
++                    }
++
++                    InitializeData initializeData;
++                    struct Resource *block = resource_map_fd(prop);
++                    if (block == nullptr) {
++                        LOGE("Companion: INITIALIZE: failed to map module.prop");
++
++                        break;
++                    }
++
++                    properties_for_each(
++                            block->base, block->length,
++                            &initializeData,
++                            reinterpret_cast<properties_for_each_block>(&extractInitializeData)
++                    );
++
++                    resource_release(block);
++
++                    if (strlen(initializeData.dataDirectory) == 0) {
++                        LOGE("Companion: INITIALIZE: dataDirectory missing in module.prop");
++
++                        break;
++                    }
++
++                    data = open(initializeData.dataDirectory, O_RDONLY | O_DIRECTORY);
++                    if (data < 0) {
++                        LOGE("Companion: INITIALIZE: open dataDirectory %s failed",
++                             initializeData.dataDirectory);
++
++                        break;
++                    }
++
++                    // commit only when everything succeeded
++                    moduleDirectory = receivedDir;
++                    moduleProp = prop;
++                    classesDex = dex;
++                    dataDirectory = data;
++                    useBinderInterceptors = initializeData.useBinderInterceptors;
++
++                    receivedDir = -1;
++                    prop = -1;
++                    dex = -1;
++                    data = -1;
++
++                    LOGD("Remote initialized: dataDirectory = %s", initializeData.dataDirectory);
++                } while (false);
++
++                if (moduleDirectory == -1) {
++                    if (receivedDir >= 0) {
++                        close(receivedDir);
++                    }
++                    if (prop >= 0) {
++                        close(prop);
++                    }
++                    if (dex >= 0) {
++                        close(dex);
++                    }
++                    if (data >= 0) {
++                        close(data);
++                    }
++                }
+             }
+ 
+-            fatal_assert(serializer_write_int(client, 1) > 0);
++            if (serializer_write_int(client, moduleDirectory != -1 ? 1 : 0) <= 0) {
++                LOGW("Companion: INITIALIZE: failed to reply");
++            }
+ 
+             pthread_mutex_unlock(&initializeLock);
+ 
+@@ -84,45 +181,71 @@ static void handleFileRequest(int client) {
+         case IS_INITIALIZED: {
+             pthread_mutex_lock(&initializeLock);
+ 
+-            fatal_assert(serializer_write_int(client, moduleDirectory != -1 ? 1 : 0) > 0);
++            if (serializer_write_int(client, moduleDirectory != -1 ? 1 : 0) <= 0) {
++                LOGW("Companion: IS_INITIALIZED: failed to reply");
++            }
+ 
+             pthread_mutex_unlock(&initializeLock);
+ 
+             break;
+         }
+         case IS_USE_BINDER_INTERCEPTORS: {
+-            fatal_assert(serializer_write_int(client, useBinderInterceptors ? 1 : 0) > 0);
++            if (serializer_write_int(client, useBinderInterceptors ? 1 : 0) <= 0) {
++                LOGW("Companion: IS_USE_BINDER_INTERCEPTORS: failed to reply");
++            }
+ 
+             break;
+         }
+         case GET_RESOURCES: {
+-            fatal_assert(serializer_write_file_descriptor(client, moduleProp) > 0);
+-            fatal_assert(serializer_write_file_descriptor(client, classesDex) > 0);
++            pthread_mutex_lock(&initializeLock);
++
++            if (moduleProp == -1 || classesDex == -1) {
++                LOGW("Companion: GET_RESOURCES: not initialized");
++
++                // Do not send anything: the client interprets the closed
++                // connection as a failure and skips injection for this fork.
++            } else if (serializer_write_file_descriptor(client, moduleProp) <= 0 ||
++                       serializer_write_file_descriptor(client, classesDex) <= 0) {
++                LOGW("Companion: GET_RESOURCES: failed to send fds");
++            }
++
++            pthread_mutex_unlock(&initializeLock);
+ 
+             break;
+         }
+         case SHOULD_ENABLE_FOR_PACKAGE: {
+             char *packageName = nullptr;
+-            fatal_assert(serializer_read_string(client, &packageName) > 0);
+ 
+-            char path[PATH_MAX] = {0};
+-            sprintf(path, "packages/%s", packageName);
+-            free(packageName);
++            if (serializer_read_string(client, &packageName) <= 0) {
++                LOGW("Companion: SHOULD_ENABLE_FOR_PACKAGE: failed to read package name");
++
++                break;
++            }
+ 
+-            if (faccessat(moduleDirectory, path, F_OK, 0) != 0) {
+-                if (faccessat(dataDirectory, path, F_OK, 0) != 0) {
+-                    fatal_assert(serializer_write_int(client, 0) > 0);
++            int enabled = 0;
+ 
+-                    break;
++            if (moduleDirectory != -1) {
++                char path[PATH_MAX] = {0};
++                snprintf(path, sizeof(path), "packages/%s", packageName);
++
++                if (faccessat(moduleDirectory, path, F_OK, 0) == 0 ||
++                    (dataDirectory != -1 && faccessat(dataDirectory, path, F_OK, 0) == 0)) {
++                    enabled = 1;
+                 }
++            } else {
++                LOGW("Companion: SHOULD_ENABLE_FOR_PACKAGE: not initialized");
+             }
+ 
+-            fatal_assert(serializer_write_int(client, 1) > 0);
++            free(packageName);
++
++            if (serializer_write_int(client, enabled) <= 0) {
++                LOGW("Companion: SHOULD_ENABLE_FOR_PACKAGE: failed to reply");
++            }
+ 
+             break;
+         }
+         default: {
+-            LOGD("Unknown command: %d", command);
++            LOGW("Companion: unknown command: %d", command);
+ 
+             break;
+         }
+@@ -160,23 +283,57 @@ void ZygoteLoaderModule::postServerSpecialize(const zygisk::ServerSpecializeArgs
+     tryLoadDex();
+ }
+ 
+-void ZygoteLoaderModule::fetchResources() {
++bool ZygoteLoaderModule::fetchResources() {
+     int remote = api->connectCompanion();
+-    fatal_assert(remote >= 0);
++    if (remote < 0) {
++        LOGW("fetchResources: connectCompanion failed");
++
++        return false;
++    }
+ 
+-    fatal_assert(serializer_write_int(remote, GET_RESOURCES) > 0);
++    if (serializer_write_int(remote, GET_RESOURCES) <= 0) {
++        LOGW("fetchResources: failed to send GET_RESOURCES");
++
++        close(remote);
++
++        return false;
++    }
+ 
+     int modulePropFd = -1;
+     int classesDexFd = -1;
+-    fatal_assert(serializer_read_file_descriptor(remote, &modulePropFd) > 0);
+-    fatal_assert(serializer_read_file_descriptor(remote, &classesDexFd) > 0);
++    if (serializer_read_file_descriptor(remote, &modulePropFd) <= 0 ||
++        serializer_read_file_descriptor(remote, &classesDexFd) <= 0) {
++        LOGW("fetchResources: failed to receive resources");
++
++        close(remote);
++
++        return false;
++    }
++
++    close(remote);
+ 
+     moduleProp = resource_map_fd(modulePropFd);
+     classesDex = resource_map_fd(classesDexFd);
+ 
+-    close(remote);
+     close(modulePropFd);
+     close(classesDexFd);
++
++    if (moduleProp == nullptr || classesDex == nullptr) {
++        LOGW("fetchResources: failed to map resources");
++
++        if (moduleProp != nullptr) {
++            resource_release(moduleProp);
++            moduleProp = nullptr;
++        }
++        if (classesDex != nullptr) {
++            resource_release(classesDex);
++            classesDex = nullptr;
++        }
++
++        return false;
++    }
++
++    return true;
+ }
+ 
+ void ZygoteLoaderModule::reset() {
+@@ -188,23 +345,31 @@ void ZygoteLoaderModule::reset() {
+ 
+     if (moduleProp != nullptr) {
+         resource_release(moduleProp);
++        moduleProp = nullptr;
+     }
+     if (classesDex != nullptr) {
+         resource_release(classesDex);
++        classesDex = nullptr;
+     }
+ }
+ 
+ void ZygoteLoaderModule::prepareFork() {
+-    if (shouldEnableForPackage(currentProcessName)) {
+-        fetchResources();
+-
+-        useBinderInterceptors = isUseBinderInterceptors();
++    if (currentProcessName != nullptr && shouldEnableForPackage(currentProcessName)) {
++        if (fetchResources()) {
++            useBinderInterceptors = isUseBinderInterceptors();
++        } else {
++            // Companion is temporarily unavailable: skip injection for this
++            // process instead of aborting (which would kill the forked app).
++            LOGW("prepareFork: failed to fetch resources, skip injection");
++
++            reset();
++        }
+     } else {
+         reset();
+     }
+ 
+     if (!useBinderInterceptors) {
+-        LOGD("Request dlclose module");
++        LOGD("Request dlclose module library");
+ 
+         api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
+     }
+@@ -226,14 +391,36 @@ void ZygoteLoaderModule::tryLoadDex() {
+ }
+ 
+ bool ZygoteLoaderModule::shouldEnableForPackage(const char *packageName) {
++    if (packageName == nullptr) {
++        LOGW("shouldEnableForPackage: null package name");
++
++        return false;
++    }
++
+     int remote = api->connectCompanion();
+-    fatal_assert(remote >= 0);
++    if (remote < 0) {
++        LOGW("shouldEnableForPackage: connectCompanion failed for %s", packageName);
++
++        return false;
++    }
+ 
+-    fatal_assert(serializer_write_int(remote, SHOULD_ENABLE_FOR_PACKAGE) > 0);
+-    fatal_assert(serializer_write_string(remote, packageName) > 0);
++    if (serializer_write_int(remote, SHOULD_ENABLE_FOR_PACKAGE) <= 0 ||
++        serializer_write_string(remote, packageName) <= 0) {
++        LOGW("shouldEnableForPackage: failed to send request for %s", packageName);
++
++        close(remote);
++
++        return false;
++    }
+ 
+     int r = 0;
+-    fatal_assert(serializer_read_int(remote, &r) > 0);
++    if (serializer_read_int(remote, &r) <= 0) {
++        LOGW("shouldEnableForPackage: failed to read reply for %s", packageName);
++
++        close(remote);
++
++        return false;
++    }
+ 
+     LOGD("Enabled status for %s: %d", packageName, r);
+ 
+@@ -242,28 +429,76 @@ bool ZygoteLoaderModule::shouldEnableForPackage(const char *packageName) {
+     return r != 0;
+ }
+ 
+-void ZygoteLoaderModule::initialize() {
++bool ZygoteLoaderModule::initialize() {
+     int remote = api->connectCompanion();
++    if (remote < 0) {
++        LOGW("initialize: connectCompanion failed");
++
++        return false;
++    }
+ 
+     int moduleDir = api->getModuleDir();
+-    fatal_assert(moduleDir >= 0);
++    if (moduleDir < 0) {
++        LOGW("initialize: getModuleDir failed");
++
++        close(remote);
++
++        return false;
++    }
++
++    if (serializer_write_int(remote, INITIALIZE) <= 0 ||
++        serializer_write_file_descriptor(remote, moduleDir) <= 0) {
++        LOGW("initialize: failed to send module dir");
+ 
+-    fatal_assert(serializer_write_int(remote, INITIALIZE) > 0);
+-    fatal_assert(serializer_write_file_descriptor(remote, moduleDir) > 0);
++        close(remote);
++
++        return false;
++    }
+ 
+     int initialized = -1;
+-    fatal_assert(serializer_read_int(remote, &initialized) > 0);
+-    fatal_assert(initialized == 1);
++    if (serializer_read_int(remote, &initialized) <= 0) {
++        LOGW("initialize: failed to read reply");
++
++        close(remote);
++
++        return false;
++    }
++
++    close(remote);
++
++    if (initialized != 1) {
++        LOGW("initialize: companion refused to initialize");
++
++        return false;
++    }
++
++    return true;
+ }
+ 
+ bool ZygoteLoaderModule::isInitialized() {
+     int remote = api->connectCompanion();
+-    fatal_assert(remote >= 0);
++    if (remote < 0) {
++        LOGW("isInitialized: connectCompanion failed");
+ 
+-    fatal_assert(serializer_write_int(remote, IS_INITIALIZED) > 0);
++        return false;
++    }
++
++    if (serializer_write_int(remote, IS_INITIALIZED) <= 0) {
++        LOGW("isInitialized: failed to send request");
++
++        close(remote);
++
++        return false;
++    }
+ 
+     int initialized = -1;
+-    fatal_assert(serializer_read_int(remote, &initialized) > 0);
++    if (serializer_read_int(remote, &initialized) <= 0) {
++        LOGW("isInitialized: failed to read reply");
++
++        close(remote);
++
++        return false;
++    }
+ 
+     close(remote);
+ 
+@@ -272,12 +507,28 @@ bool ZygoteLoaderModule::isInitialized() {
+ 
+ bool ZygoteLoaderModule::isUseBinderInterceptors() {
+     int remote = api->connectCompanion();
+-    fatal_assert(remote >= 0);
++    if (remote < 0) {
++        LOGW("isUseBinderInterceptors: connectCompanion failed");
++
++        return false;
++    }
++
++    if (serializer_write_int(remote, IS_USE_BINDER_INTERCEPTORS) <= 0) {
++        LOGW("isUseBinderInterceptors: failed to send request");
+ 
+-    fatal_assert(serializer_write_int(remote, IS_USE_BINDER_INTERCEPTORS) > 0);
++        close(remote);
++
++        return false;
++    }
+ 
+     int enabled = 0;
+-    fatal_assert(serializer_read_int(remote, &enabled) > 0);
++    if (serializer_read_int(remote, &enabled) <= 0) {
++        LOGW("isUseBinderInterceptors: failed to read reply");
++
++        close(remote);
++
++        return false;
++    }
+ 
+     close(remote);
+ 
+diff --git a/runtime/src/main/cpp/main_zygisk.h b/runtime/src/main/cpp/main_zygisk.h
+index ecfc7f7..144cba1 100644
+--- a/runtime/src/main/cpp/main_zygisk.h
++++ b/runtime/src/main/cpp/main_zygisk.h
+@@ -15,14 +15,14 @@ public:
+     void postServerSpecialize(const zygisk::ServerSpecializeArgs *args) override;
+ 
+ public:
+-    void fetchResources();
++    bool fetchResources();
+     void reset();
+     bool shouldEnableForPackage(const char *packageName);
+     void prepareFork();
+     void tryLoadDex();
+ 
+ private:
+-    void initialize();
++    bool initialize();
+     bool isInitialized();
+     bool isUseBinderInterceptors();
+ 
+@@ -35,4 +35,4 @@ private:
+ 
+     char *currentProcessName = nullptr;
+     bool useBinderInterceptors = false;
+-};
+\ No newline at end of file
++};
+diff --git a/runtime/src/main/cpp/process.c b/runtime/src/main/cpp/process.c
+index 1625a12..23c26fd 100644
+--- a/runtime/src/main/cpp/process.c
++++ b/runtime/src/main/cpp/process.c
+@@ -1,17 +1,42 @@
+ #include "process.h"
+ 
++#include "logger.h"
++
+ #include <stddef.h>
+ #include <string.h>
++#include <stdlib.h>
+ 
+ void process_get_package_name(JNIEnv *env, jstring process_name, char **package_name) {
++    *package_name = NULL;
++
++    if (process_name == NULL) {
++        return;
++    }
++
+     const char *str = (*env)->GetStringUTFChars(env, process_name, NULL);
+ 
++    // GetStringUTFChars fails (returns NULL with a pending exception) on OOM;
++    // this MUST NOT crash the freshly forked process.
++    if (str == NULL) {
++        LOGW("process_get_package_name: GetStringUTFChars failed");
++
++        if ((*env)->ExceptionCheck(env)) {
++            (*env)->ExceptionClear(env);
++        }
++
++        return;
++    }
++
+     *package_name = strdup(str);
+ 
++    (*env)->ReleaseStringUTFChars(env, process_name, str);
++
++    if (*package_name == NULL) {
++        return;
++    }
++
+     char *split = strchr(*package_name, ':');
+     if (split != NULL) {
+         *split = '\0';
+     }
+-
+-    (*env)->ReleaseStringUTFChars(env, process_name, str);
+ }
+diff --git a/runtime/src/main/java/com/github/kr328/zloader/internal/Loader.java b/runtime/src/main/java/com/github/kr328/zloader/internal/Loader.java
+index 1ec296d..5f6bd97 100644
+--- a/runtime/src/main/java/com/github/kr328/zloader/internal/Loader.java
++++ b/runtime/src/main/java/com/github/kr328/zloader/internal/Loader.java
+@@ -120,7 +120,7 @@ public final class Loader {
+     }
+ 
+     public static boolean unregisterRedirectBinder(final Binder source) {
+-        if (isBinderInterceptorAvailable) {
++        if (!isBinderInterceptorAvailable) {
+             throw new IllegalStateException("Binder interceptor disabled");
+         }
+ 
+@@ -136,7 +136,7 @@ public final class Loader {
+             final Parcel reply,
+             final int flags
+     ) {
+-        if (isBinderInterceptorAvailable) {
++        if (!isBinderInterceptorAvailable) {
+             throw new IllegalStateException("Binder interceptor disabled");
+         }
+ 
+-- 
+2.47.0.windows.1
+
